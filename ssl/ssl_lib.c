@@ -703,30 +703,30 @@ SSL *SSL_new(SSL_CTX *ctx)
 
 int ossl_ssl_init(SSL *ssl, SSL_CTX *ctx, const SSL_METHOD *method, int type)
 {
-    ssl->type = type;
+    if (!SSL_CTX_up_ref(ctx))
+        return 0;
 
     ssl->lock = CRYPTO_THREAD_lock_new();
-    if (ssl->lock == NULL)
-        return 0;
 
-    if (!CRYPTO_NEW_REF(&ssl->references, 1)) {
-        CRYPTO_THREAD_lock_free(ssl->lock);
-        return 0;
-    }
+    if (ssl->lock == NULL || !CRYPTO_NEW_REF(&ssl->references, 1))
+        goto err;
 
     if (!CRYPTO_new_ex_data(CRYPTO_EX_INDEX_SSL, ssl, &ssl->ex_data)) {
-        CRYPTO_THREAD_lock_free(ssl->lock);
         CRYPTO_FREE_REF(&ssl->references);
-        ssl->lock = NULL;
-        return 0;
+        goto err;
     }
 
-    SSL_CTX_up_ref(ctx);
     ssl->ctx = ctx;
-
+    ssl->type = type;
     ssl->defltmeth = ssl->method = method;
 
     return 1;
+
+err:
+    CRYPTO_THREAD_lock_free(ssl->lock);
+    ssl->lock = NULL;
+    SSL_CTX_free(ctx);
+    return 0;
 }
 
 SSL *ossl_ssl_connection_new_int(SSL_CTX *ctx, SSL *user_ssl,
@@ -824,7 +824,10 @@ SSL *ossl_ssl_connection_new_int(SSL_CTX *ctx, SSL *user_ssl,
     s->ext.ocsp.exts = NULL;
     s->ext.ocsp.resp = NULL;
     s->ext.ocsp.resp_len = 0;
-    SSL_CTX_up_ref(ctx);
+
+    if (!SSL_CTX_up_ref(ctx))
+        goto err;
+
     s->session_ctx = ctx;
     if (ctx->ext.ecpointformats) {
         s->ext.ecpointformats =
@@ -1964,8 +1967,8 @@ X509 *SSL_get1_peer_certificate(const SSL *s)
 {
     X509 *r = SSL_get0_peer_certificate(s);
 
-    if (r != NULL)
-        X509_up_ref(r);
+    if (r != NULL && !X509_up_ref(r))
+        return NULL;
 
     return r;
 }
@@ -2324,7 +2327,8 @@ int ssl_read_internal(SSL *s, void *buf, size_t num, size_t *readbytes)
      * If we are a client and haven't received the ServerHello etc then we
      * better do that
      */
-    ossl_statem_check_finish_init(sc, 0);
+    if (!ossl_statem_check_finish_init(sc, 0))
+        return -1;
 
     if ((sc->mode & SSL_MODE_ASYNC) && ASYNC_get_current_job() == NULL) {
         struct ssl_async_args args;
@@ -2548,7 +2552,8 @@ int ssl_write_internal(SSL *s, const void *buf, size_t num,
         return 0;
     }
     /* If we are a client and haven't sent the Finished we better do that */
-    ossl_statem_check_finish_init(sc, 1);
+    if (!ossl_statem_check_finish_init(sc, 1))
+        return -1;
 
     if ((sc->mode & SSL_MODE_ASYNC) && ASYNC_get_current_job() == NULL) {
         int ret;
@@ -4726,8 +4731,7 @@ void ssl_update_cache(SSL_CONNECTION *s, int mode)
          * TLSv1.3 without early data because some applications just want to
          * know about the creation of a session and aren't doing a full cache.
          */
-        if (s->session_ctx->new_session_cb != NULL) {
-            SSL_SESSION_up_ref(s->session);
+        if (s->session_ctx->new_session_cb != NULL && SSL_SESSION_up_ref(s->session)) {
             if (!s->session_ctx->new_session_cb(SSL_CONNECTION_GET_USER_SSL(s),
                                                 s->session))
                 SSL_SESSION_free(s->session);
@@ -4925,7 +4929,8 @@ int SSL_do_handshake(SSL *s)
         return -1;
     }
 
-    ossl_statem_check_finish_init(sc, -1);
+    if (!ossl_statem_check_finish_init(sc, -1))
+        return -1;
 
     s->method->ssl_renegotiate_check(s, 0);
 
@@ -5437,24 +5442,19 @@ SSL_CTX *SSL_set_SSL_CTX(SSL *ssl, SSL_CTX *ctx)
     if (ctx == NULL)
         ctx = sc->session_ctx;
     new_cert = ssl_cert_dup(ctx->cert);
-    if (new_cert == NULL) {
-        return NULL;
-    }
-
-    if (!custom_exts_copy_flags(&new_cert->custext, &sc->cert->custext)) {
-        ssl_cert_free(new_cert);
-        return NULL;
-    }
-
-    ssl_cert_free(sc->cert);
-    sc->cert = new_cert;
+    if (new_cert == NULL)
+        goto err;
+    if (!custom_exts_copy_flags(&new_cert->custext, &sc->cert->custext))
+        goto err;
 
     /*
      * Program invariant: |sid_ctx| has fixed size (SSL_MAX_SID_CTX_LENGTH),
      * so setter APIs must prevent invalid lengths from entering the system.
      */
     if (!ossl_assert(sc->sid_ctx_length <= sizeof(sc->sid_ctx)))
-        return NULL;
+        goto err;
+    if (!SSL_CTX_up_ref(ctx))
+        goto err;
 
     /*
      * If the session ID context matches that of the parent SSL_CTX,
@@ -5469,11 +5469,16 @@ SSL_CTX *SSL_set_SSL_CTX(SSL *ssl, SSL_CTX *ctx)
         memcpy(&sc->sid_ctx, &ctx->sid_ctx, sizeof(sc->sid_ctx));
     }
 
-    SSL_CTX_up_ref(ctx);
+    ssl_cert_free(sc->cert);
+    sc->cert = new_cert;
     SSL_CTX_free(ssl->ctx);     /* decrement reference count */
     ssl->ctx = ctx;
 
     return ssl->ctx;
+
+err:
+    ssl_cert_free(new_cert);
+    return NULL;
 }
 
 int SSL_CTX_set_default_verify_paths(SSL_CTX *ctx)
@@ -5698,8 +5703,9 @@ void SSL_CTX_set_cert_store(SSL_CTX *ctx, X509_STORE *store)
 
 void SSL_CTX_set1_cert_store(SSL_CTX *ctx, X509_STORE *store)
 {
-    if (store != NULL)
-        X509_STORE_up_ref(store);
+    if (store != NULL && !X509_STORE_up_ref(store))
+        return;
+
     SSL_CTX_set_cert_store(ctx, store);
 }
 
@@ -8220,6 +8226,9 @@ int SSL_set1_client_cert_type(SSL *s, const unsigned char *val, size_t len)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
 
+    if (sc == NULL)
+        return 0;
+
     return set_cert_type(&sc->client_cert_type, &sc->client_cert_type_len,
                          val, len);
 }
@@ -8227,6 +8236,9 @@ int SSL_set1_client_cert_type(SSL *s, const unsigned char *val, size_t len)
 int SSL_set1_server_cert_type(SSL *s, const unsigned char *val, size_t len)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
+
+    if (sc == NULL)
+        return 0;
 
     return set_cert_type(&sc->server_cert_type, &sc->server_cert_type_len,
                          val, len);

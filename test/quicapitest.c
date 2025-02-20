@@ -554,6 +554,7 @@ static int test_ssl_trace(void)
 }
 #endif
 
+#ifndef OPENSSL_NO_SSL_TRACE
 enum {
     INITIAL = 0,
     GATHER_TOKEN = 1,
@@ -687,6 +688,7 @@ static int test_new_token(void)
 
     return testresult;
 }
+#endif
 
 static int ensure_valid_ciphers(const STACK_OF(SSL_CIPHER) *ciphers)
 {
@@ -1290,10 +1292,8 @@ static int use_session_cb(SSL *ssl, const EVP_MD *md, const unsigned char **id,
 {
     use_session_cb_cnt++;
 
-    if (clientpsk == NULL)
+    if (clientpsk == NULL || !SSL_SESSION_up_ref(clientpsk))
         return 0;
-
-    SSL_SESSION_up_ref(clientpsk);
 
     *sess = clientpsk;
     *id = (const unsigned char *)pskid;
@@ -1307,15 +1307,16 @@ static int find_session_cb(SSL *ssl, const unsigned char *identity,
 {
     find_session_cb_cnt++;
 
-    if (serverpsk == NULL)
+    if (serverpsk == NULL || !SSL_SESSION_up_ref(serverpsk))
         return 0;
 
     /* Identity should match that set by the client */
     if (strlen(pskid) != identity_len
-            || strncmp(pskid, (const char *)identity, identity_len) != 0)
+            || strncmp(pskid, (const char *)identity, identity_len) != 0) {
+        SSL_SESSION_free(serverpsk);
         return 0;
+    }
 
-    SSL_SESSION_up_ref(serverpsk);
     *sess = serverpsk;
 
     return 1;
@@ -1341,10 +1342,9 @@ static int test_quic_psk(void)
     find_session_cb_cnt = 0;
 
     clientpsk = serverpsk = create_a_psk(clientquic, SHA384_DIGEST_LENGTH);
-    if (!TEST_ptr(clientpsk))
-        goto end;
     /* We already had one ref. Add another one */
-    SSL_SESSION_up_ref(clientpsk);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
 
     if (!TEST_true(qtest_create_quic_connection(qtserv, clientquic))
             || !TEST_int_eq(1, find_session_cb_cnt)
@@ -2740,7 +2740,9 @@ int setup_tests(void)
     ADD_TEST(test_domain_flags);
     ADD_TEST(test_early_ticks);
     ADD_TEST(test_ssl_new_from_listener);
+#ifndef OPENSSL_NO_SSL_TRACE
     ADD_TEST(test_new_token);
+#endif
     return 1;
  err:
     cleanup_tests();
